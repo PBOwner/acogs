@@ -17,8 +17,10 @@ from .constants import (
     NEUTRAL_COLOR,
     VILLAGERS_COLOR,
 )  # NOQA
+from .famine_apocalypses import FAMINE_APOCALYPSES, FamineApocalypse
 from .utils import get_death_reason, get_image
 from .views import (
+    FamineApocalypseSelectView,
     GamblerView,
     GuessTargetsRolesView,
     IsekaiView,
@@ -75,7 +77,9 @@ class Player:
     cupid_lovers: typing.Tuple["Player"] = field(default_factory=tuple)
     duelist_special_attack: bool = False
     builder_bricks: int = 0
-    farmer_plants: int = 0
+    farmer_plants: int = 1
+    famine_used_apocalypses: typing.List[FamineApocalypse] = field(default_factory=list)
+    famine_alive_players_before_life_death_swap: typing.List["Player"] = field(default_factory=list)
     developer_role_in_use: typing.Optional[typing.Type["Role"]] = None
 
     def __hash__(self) -> int:
@@ -488,32 +492,34 @@ class Role:
     @classmethod
     def has_won(cls, player: Player) -> bool:
         mafia_check = (
-            len(
-                [
-                    p
-                    for p in player.game.alive_players
-                    if p.role.side == "Mafia" or p.is_town_traitor
-                ]
-            )
-            >= len(
-                [
-                    p
-                    for p in player.game.alive_players
-                    if p.role.side != "Mafia" and not p.is_town_traitor
-                ]
-            )
-            or (
-                all(p.is_dead for p in player.game.players if p.role.side == "Mafia")
-                and any(p for p in player.game.alive_players if p.is_town_traitor)
-                and player.game.current_number
-                - max(
-                    p.death_day_night_number
-                    for p in player.game.dead_players
-                    if p.role.side == "Mafia"
+            (
+                len(
+                    [
+                        p
+                        for p in player.game.alive_players
+                        if p.role.side == "Mafia" or p.is_town_traitor
+                    ]
                 )
-                >= 3
+                >= len(
+                    [
+                        p
+                        for p in player.game.alive_players
+                        if p.role.side != "Mafia" and not p.is_town_traitor
+                    ]
+                )
+                or (
+                    all(p.is_dead for p in player.game.players if p.role.side == "Mafia")
+                    and any(p for p in player.game.alive_players if p.is_town_traitor)
+                    and player.game.current_number
+                    - max(
+                        p.death_day_night_number
+                        for p in player.game.dead_players
+                        if p.role.side == "Mafia"
+                    )
+                    >= 3
+                )
             )
-            and not any(p.has_won for p in player.game.alive_players if p.role is Jester)
+            and not any(p.has_won for p in player.game.players if p.role is Jester)
         )
         villager_check = (
             all(
@@ -580,6 +586,7 @@ def perform_action_select_targets(
     self_allowed: bool = True,
     mafia_allowed: bool = True,
     last_target_allowed: bool = True,
+    dead_targets: bool = False,
     condition: typing.Callable[[Player, Player], bool] = None,
     two_selects: bool = False,
     second_select_optional: bool = False,
@@ -590,7 +597,7 @@ def perform_action_select_targets(
         interaction: discord.Interaction,
         content: typing.Optional[str] = None,
         **kwargs,
-    ) -> None:
+    ) -> SelectTargetsView:
         view: SelectTargetsView = SelectTargetsView(night, player, **kwargs)
         await interaction.followup.send(
             _(content),
@@ -598,6 +605,7 @@ def perform_action_select_targets(
             ephemeral=True,
         )
         view._message = await interaction.original_response()
+        return view
 
     return functools.partial(
         func,
@@ -605,6 +613,7 @@ def perform_action_select_targets(
         self_allowed=self_allowed,
         mafia_allowed=mafia_allowed,
         last_target_allowed=last_target_allowed,
+        dead_targets=dead_targets,
         condition=condition,
         two_selects=two_selects,
         second_select_optional=second_select_optional,
@@ -743,6 +752,17 @@ class GodFather(Role):
                 "Your God Father is about to die and appointed you to replace them at the head of the Mafia! *You will now be able to choose who to kill every night...*"
             ),
         )
+        for p in mafia_players[1:]:
+            await p.send(
+                embed=discord.Embed(
+                    title=_("**{new_god_father.member.display_name}** is now the new **{role_name}**!").format(
+                        new_god_father=new_god_father,
+                        role_name=new_god_father.role.display_name(player.game),
+                    ),
+                    color=new_god_father.role.color(),
+                ).set_image(url=new_god_father.role.image_url()),
+                file=new_god_father.role.get_image(player.game),
+            )
 
 
 class Mafia(Role):
@@ -996,7 +1016,7 @@ class Vigilante(Role):
     async def perform_action(cls, night, player: Player, interaction: discord.Interaction) -> None:
         if night.number == 1 and not night.game.config["vigilante_shoot_night_1"]:
             raise RuntimeError(_("The Vigilante can't shoot on Night 1."))
-        if any(t for t in player.game_targets if t.side == "Villagers"):
+        if any(t for t in player.game_targets if t.role.side == "Villagers"):
             raise RuntimeError(
                 _(
                     "You can't use your ability anymore, as you have killed someone on the villagers' side (even if they were a Town Traitor)."
@@ -2084,7 +2104,6 @@ class Goose(Role):
     perform_action = perform_action_select_targets(
         self_allowed=False,
         mafia_allowed=False,
-        condition=lambda player, target: target.role is not Goose,
     )
 
     @classmethod
@@ -2339,12 +2358,15 @@ class Isekai(Role):
 
     @classmethod
     async def on_death(cls, player: Player) -> None:
+        if player.death_cause == "afk":
+            return
         roles = random.sample(
             [
                 role
                 for role in ROLES
                 if role is not Isekai
                 and not any(p for p in player.game.alive_players if p.role is role)
+                and role.starting
             ],
             3,
         )
@@ -2623,7 +2645,7 @@ class Gambler(Role):
         dice = night.gamblers_dices[player]
         if player not in night.gamblers_results:
             if dice == "white":
-                if random.random() >= 0.70:
+                if random.random() < 0.70:
                     night.gamblers_results[player] = (True, None)
                 else:
                     distracted = random.choice(
@@ -2631,7 +2653,7 @@ class Gambler(Role):
                     )
                     night.gamblers_results[player] = (False, distracted)
             elif dice == "yellow":
-                if random.random() >= 0.50:
+                if random.random() < 0.50:
                     p = random.choice(
                         [p for p in night.game.alive_players if p.role.side == "Villagers"]
                     )
@@ -2639,7 +2661,7 @@ class Gambler(Role):
                 else:
                     night.gamblers_results[player] = (False, None)
             elif dice == "red":
-                if random.random() >= 0.20:
+                if random.random() < 0.20:
                     revived = random.choice(
                         [p for p in night.game.dead_players if p.role.side == "Villagers"]
                     )
@@ -2997,9 +3019,9 @@ class Harbinger(Role):
                 for p2, t2 in night.targets.items()
                 if t2 == player
                 and p2.role.visit_type == "Active"
-                and ROLES_PRIORITY.index(p2.role) > ROLES_PRIORITY.index(p.role)
+                and ROLE_PRIORITY.index(p2.role) > ROLE_PRIORITY.index(p.role)
             ]
-            if (len(possible_p) == 0 or random.random() < 0.35) and not any(
+            if (not possible_p or random.random() < 0.35) and not any(
                 p3.death_day_night_number == night.number and p3.death_cause == player
                 for p3 in night.game.dead_players
             ):
@@ -3739,6 +3761,7 @@ class Mortician(Role):
 
     perform_action = perform_action_select_targets(
         self_allowed=False,
+        dead_targets=True,
         condition=lambda player, target: (
             (
                 target.death_cause == "Mafia"
@@ -3964,7 +3987,7 @@ class Cupid(Role):
 
     @classmethod
     async def no_action(cls, night, player: Player) -> None:
-        if night.number == 1:
+        if night.number == player.first_role_night_number:
             await cls.action(night, player, None)
 
     @classmethod
@@ -4297,7 +4320,8 @@ class Necromancer(Role):
         await perform_action_select_targets(
             targets_number=2,
             self_allowed=False,
-            condition=lambda player, target: not any(t[0] is target for t in player.game_targets),
+            dead_targets=True,
+            condition=lambda player, target: not any(t[0] is target for t in player.game_targets) and target.death_cause != "afk",
             two_selects=True,
             second_select_optional=player.uses_amount < player.role.max_uses,
         )(night, player, interaction)
@@ -4371,7 +4395,7 @@ class Duelist(Role):
 
     @classmethod
     async def perform_action(cls, night, player: Player, interaction: discord.Interaction) -> None:
-        if night.number == 1 or player.duelist_special_attack:
+        if night.number == player.first_role_night_number or player.duelist_special_attack:
             await perform_action_select_targets(self_allowed=False)(night, player, interaction)
         else:
             await interaction.followup.send(
@@ -4381,7 +4405,7 @@ class Duelist(Role):
 
     @classmethod
     async def action(cls, night, player: Player, target: typing.Optional[Player]) -> None:
-        if night.number == 1:
+        if night.number == player.first_role_night_number:
             player.global_target = target or random.choice(
                 [p for p in night.game.alive_players if p != player]
             )
@@ -4684,7 +4708,7 @@ class Farmer(Role):
     side: str = "Neutral"
     description: str = _("The Farmer is a master of plants and agriculture.")
     ability: str = _(
-        "Each night, the Farmer can choose to plant a seed or give a plant to a player. When they plant a seed, that seed will become a plant the next day. If they give a plant to a player, the player's role will change to their base team role: Villagers will turn into Villager, Mafia's members will turn into Mafia and Neutral's players will turn into Jester. Once they have given a plant to a player from each team, they will transform into **Famine, Horseman of the Apocalypse**."
+        "Each night, the Farmer can choose to plant a seed or give a plant to a player. You can get a seed each night without action. When they plant a seed, that seed will become a plant the next day. If they give a plant to a player, the player's role will change to their base side role: Villagers will turn into Villager, Mafia's members will turn into Mafia and Neutral's players will turn into Jester. Once they have given a plant to a player from each team, they will transform into **Famine, Horseman of the Apocalypse**."
     )
     objective: str = _("Transform into Famine, Horseman of the Apocalypse.")
     theme_names = {"one-piece": "Kurozumi Kanjuro"}
@@ -4700,23 +4724,49 @@ class Farmer(Role):
         await perform_action_select_targets(
             self_allowed=False,
             last_target_allowed=False,
-            condition=lambda player, target: target not in player.targets,
+            condition=lambda player, target: target not in player.game_targets,
         )(night, player, interaction)
 
     @classmethod
     async def action(cls, night, player: Player, target: Player) -> None:
         player.farmer_plants -= 1
         if target.role.side == "Villagers":
-            target.role = Villager
+            base_role = Villager
         elif target.role.side == "Mafia":
-            target.role = random.choice(MAFIA_HIERARCHY)
+            base_role = Mafia
         else:
-            target.role = Jester
-        if len({p.role.side for p in player.farmer_plants}) == 3:
+            base_role = Jester
+        await target.change_role(
+            base_role,
+            reason=_("Your role has been changed to the base role of your side by the Farmer."),
+        )
+        if not any(p.role is GodFather for p in night.game.alive_players):
+            new_god_father = sorted(
+                [p for p in night.game.alive_players if p.role.side == "Mafia"],
+                key=lambda p: (MAFIA_HIERARCHY.index(p.role), player.game.players.index(p)),
+            )[0]
+            await new_god_father.change_role(
+                GodFather,
+                reason=_("The previous God Father lost his position in a duel against you..."),
+            )
+            for p in night.game.alive_players:
+                if (p.role.side != "Mafia" and not p.is_town_traitor) or p == new_god_father:
+                    continue
+                await p.send(
+                    embed=discord.Embed(
+                        title=_("**{new_god_father.member.display_name}** is now the new **{role_name}**!").format(
+                            new_god_father=new_god_father,
+                            role_name=new_god_father.role.display_name(night.game),
+                        ),
+                        color=new_god_father.role.color(),
+                    ).set_image(url=new_god_father.role.image_url()),
+                    file=new_god_father.role.get_image(night.game),
+                )
+        if len({p.role.side for p in player.game_targets + [target]}) == 3:
             await player.change_role(
                 Famine,
                 reason=_(
-                    "You gave a plant to a player from each team... You have transformed into **Famine, Horseman of the Apocalypse**!"
+                    "You gave a plant to a player from each side... You have transformed into **Famine, Horseman of the Apocalypse**!"
                 ),
             )
 
@@ -4725,16 +4775,56 @@ class Farmer(Role):
         player.farmer_plants += 1
 
 
-APOCALYPSES: typing.List[str] = [
-    _("Swap all living players with dead players. You'll appear as a dead player for 1 day."),
-    _("Kill 2 random players."),
-    _("Permanently remove the vote of a player."),
-    _("Revive a player of your choice."),
-    _("Change a random player's role into any neutral role available."),
-    _("Control a player of your choice to visit any target of your choice."),
-    _("Permanently distract a player of your choice."),
-    _("Change the votes required to be 0 for one day."),
-]
+APOCALYPSES: typing.Dict[str, typing.Dict[typing.Literal["name", "emoji", "description", "targets_number"], typing.Union[str, int]]] = {
+    "swap_life_death": {
+        "name": _("Life/Death Swap"),
+        "emoji": "🔄",
+        "description": _("Swap all living players with dead players. You'll appear as a dead player for 1 day."),
+        "targets_number": 0,
+    },
+    "double_kill": {
+        "name": _("Mass Execution"),
+        "emoji": "💀",
+        "description": _("Kill 2 random players."),
+        "targets_number": 0,
+    },
+    "remove_vote": {
+        "name": _("Silenced Forever"),
+        "emoji": "🔇",
+        "description": _("Permanently remove the vote of a player."),
+        "targets_number": 1,
+    },
+    "revive_player": {
+        "name": _("Resurrection"),
+        "emoji": "✨",
+        "description": _("Revive a player of your choice."),
+        "targets_number": 1,
+    },
+    "random_neutral_role": {
+        "name": _("Neutral Chaos"),
+        "emoji": "🎭",
+        "description": _("Change a random player's role into any neutral role available."),
+        "targets_number": 0,
+    },
+    "control_target": {
+        "name": _("Forced Control"),
+        "emoji": "🕸️",
+        "description": _("Control a player of your choice to visit any target of your choice."),
+        "targets_number": 2,
+    },
+    "permanent_distract": {
+        "name": _("Eternal Distraction"),
+        "emoji": "🙈",
+        "description": _("Permanently distract a player of your choice."),
+        "targets_number": 1,
+    },
+    "zero_votes": {
+        "name": _("Vote Collapse"),
+        "emoji": "⚠️",
+        "description": _("Change the votes required to be 0 for one day."),
+        "targets_number": 0,
+    },
+}
 
 
 class Famine(Role):
@@ -4744,7 +4834,7 @@ class Famine(Role):
         "Famine, Horseman of the Apocalypse, is a bringer of hunger and starvation."
     )
     ability: str = _(
-        "Each night, Famine can choose to bring forth an apocalypse. They have 8 apocalypses to choose from. Once they have chosen an apocalypse, they can no longer use the same apocalypse until they use every other apocalypse."
+        "Each night, Famine can choose to bring forth an apocalypse. They have 6 apocalypses to choose from. Once they have chosen an apocalypse, they can no longer use the same apocalypse until they use every other apocalypse."
     )
     visit_type: str = "Active"
     objective: str = _("Be the last one standing.")
@@ -4781,33 +4871,52 @@ class Famine(Role):
 
     @classmethod
     async def perform_action(cls, night, player: Player, interaction: discord.Interaction) -> None:
+        _: Translator = Translator("MafiaGame", __file__)
+        view: FamineApocalypseSelectView = FamineApocalypseSelectView(
+            night, player,
+            apocalypses=[
+                apocalypse
+                for apocalypse in FAMINE_APOCALYPSES
+                if apocalypse not in player.famine_used_apocalypses
+            ],
+        )
         await interaction.followup.send(
             embed=discord.Embed(
-                title=_("Choose an apocalypse to bring forth:"),
-                description="\n".join(
-                    [
-                        f"- {apocalypse}"
-                        for apocalypse in set(APOCALYPSES) - set(player.famine_used_apocalypses)
-                    ]
-                ),
+                title=_("Choose an apocalypse to bring forth..."),
                 color=cls.color(),
             ),
+            view=view,
+            ephemeral=True,
         )
+        view._message = await interaction.original_response()
 
     @classmethod
     async def action(
-        cls, night, player: Player, target: typing.Tuple[int, typing.Optional[Player]]
+        cls, night, player: Player, target: typing.Optional[typing.Union[Player, typing.Tuple[Player, Player]]]
     ) -> None:
-        apocalypse = APOCALYPSES[int(target[0]) - 1]
+        apocalypse = player.famine_used_apocalypses[-1]
         await player.send(
             embed=discord.Embed(
-                title=_("You have brought forth the **{apocalypse}** apocalypse!").format(
-                    apocalypse=apocalypse
+                title=_("You have brought forth the **{emoji} {name}** apocalypse!").format(
+                    emoji=apocalypse.emoji, name=_(apocalypse.name)
                 ),
                 color=cls.color(),
             ),
         )
-        player.famine_used_apocalypses[apocalypse] = target[1]
+        try:
+            await apocalypse.action(night, player, target)
+        except NotImplementedError:
+            pass
+
+    @classmethod
+    async def next_end_day_action(
+        cls, day, player: Player, target: typing.Optional[typing.Union[Player, typing.Tuple[Player, Player]]]
+    ) -> None:
+        apocalypse = player.famine_used_apocalypses[-1]
+        try:
+            await apocalypse.next_end_day_action(day, player, target)
+        except NotImplementedError:
+            pass
 
 
 class Doomsayer(Role):
@@ -4922,7 +5031,7 @@ class War(Role):
     @classmethod
     async def perform_action(cls, night, player: Player, interaction: discord.Interaction) -> None:
         await perform_action_select_targets(
-            targets_number=night.number - player.first_role_night_number,
+            targets_number=min(night.number - player.first_role_night_number, 25),
             self_allowed=False,
         )(night, player, interaction)
 
@@ -4935,8 +5044,8 @@ class War(Role):
 HORSEMEN_OF_THE_APOCALYPSE_ROLES: typing.List[typing.Type["Role"]] = [
     GraveRobber,
     Death,
-    # Farmer,
-    # Famine,
+    Farmer,
+    Famine,
     Doomsayer,
     War,
 ]
@@ -4995,7 +5104,7 @@ ROLES: typing.List[typing.Type["Role"]] = (
     + [Developer]
 )
 
-ROLES_PRIORITY: typing.List[typing.Type["Role"]] = [
+ROLE_PRIORITY: typing.List[typing.Type["Role"]] = [
     Developer,
     Submissor,
     Duelist,
@@ -5050,6 +5159,10 @@ ROLES_PRIORITY: typing.List[typing.Type["Role"]] = [
     Thief,
     Builder,
 ] + [Death, Isekai, Judge, Lawyer, Manipulator, Politician, Villager]
+assert all(role in ROLE_PRIORITY for role in ROLES)
+from .famine_apocalypses import ROLES as FAMINE_APOCALYPSES_ROLES, perform_action_select_targets as famine_apocalypses_perform_action_select_targets
+FAMINE_APOCALYPSES_ROLES.extend(ROLES)
+famine_apocalypses_perform_action_select_targets.append(perform_action_select_targets)
 MAFIA_HIERARCHY: typing.List[typing.Type["Role"]] = [
     GodFather,
     Mafia,
@@ -5065,6 +5178,7 @@ MAFIA_HIERARCHY: typing.List[typing.Type["Role"]] = [
     Harbinger,
     MafiaAlchemist,
 ]
+assert all(role in MAFIA_HIERARCHY for role in ROLES if role.side == "Mafia")
 
 
 ACHIEVEMENTS: typing.Dict[

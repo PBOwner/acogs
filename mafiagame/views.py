@@ -12,6 +12,7 @@ import random
 from redbot.core import bank
 from redbot.core.utils.chat_formatting import humanize_timedelta
 
+from .famine_apocalypses import FamineApocalypse
 from .constants import (
     ACHIEVEMENTS_COLOR,
     ANOMALIES_COLOR,
@@ -584,6 +585,26 @@ class PerformActionView(discord.ui.View):
                 _("You have already used your action the maximum amount of times!"), ephemeral=True
             )
             return
+        for p in self.night.game.players:
+            if p.role.name != "Famine":
+                continue
+            night_targets = [
+                night.targets[player]
+                for night in self.night.game.days_nights
+                if night.__class__.__name__ == "Night" and player in night.targets
+            ]
+            for i, famine_apocalypse in enumerate(p.famine_used_apocalypses):
+                if (
+                    famine_apocalypse.__class__.__name__ == "EternalDistraction"
+                    and player == night_targets[i]
+                ):
+                    await interaction.followup.send(
+                        _(
+                            "You can't perform any night action eternally because of the **Eternal Distraction** Famine's apocalypse!"
+                        ),
+                        ephemeral=True,
+                    )
+                    return
         try:
             await player.role.perform_action(self.night, player, interaction)
         except NotImplementedError:
@@ -611,6 +632,7 @@ class SelectTargetsView(discord.ui.View):
         self_allowed: bool = True,
         mafia_allowed: bool = True,
         last_target_allowed: bool = True,
+        dead_targets: bool = False,
         condition: typing.Callable[[typing.Any, typing.Any], bool] = None,
         two_selects: bool = False,
         second_select_optional: bool = False,
@@ -623,6 +645,7 @@ class SelectTargetsView(discord.ui.View):
         self.self_allowed: bool = self_allowed
         self.mafia_allowed: bool = mafia_allowed
         self.last_target_allowed: bool = last_target_allowed
+        self.dead_targets: bool = dead_targets
         self.condition: typing.Callable[[typing.Any, typing.Any], bool] = condition
         self.two_selects: bool = two_selects
         self.second_select_optional: bool = second_select_optional
@@ -640,7 +663,7 @@ class SelectTargetsView(discord.ui.View):
             for target in (
                 self.day_night.game.alive_players
                 if select is not self.select
-                or self.player.role.name not in ("Mortician", "Necromancer")
+                or not self.dead_targets
                 else self.day_night.game.dead_players
             ):
                 if (
@@ -1433,6 +1456,48 @@ class GamblerView(discord.ui.View):
         self.player.last_interaction = interaction
 
 
+class FamineApocalypseSelectView(discord.ui.View):
+    def __init__(self, night, player, apocalypses: typing.List[FamineApocalypse]) -> None:
+        super().__init__(timeout=180)
+        self.night = night
+        self.player = player
+        self.apocalypses: typing.List[FamineApocalypse] = apocalypses
+        self._message: discord.Message = None
+
+        _: Translator = Translator("MafiaGame", __file__)
+        for apocalypse in self.apocalypses:
+            self.select.add_option(
+                label=_(apocalypse.name),
+                emoji=apocalypse.emoji,
+                description=_(apocalypse.description),
+                value=apocalypse.__name__,
+            )
+
+        self.select.placeholder = _("Select an apocalypse to bring.")
+
+    async def on_timeout(self) -> None:
+        try:
+            await self._message.delete()
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.select(min_values=0, max_values=1, placeholder="Select an apocalypse to bring.")
+    async def select(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
+        if select.values:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            apocalypse = next(
+                apocalypse
+                for apocalypse in self.apocalypses
+                if apocalypse.__name__ == select.values[0]
+            )
+            await apocalypse.perform_action(self.night, self.player, interaction)
+        else:
+            self.player.famine_used_apocalypses = self.player.famine_used_apocalypses[:-1]
+            self.night.targets.pop(self.player, None)
+            await interaction.response.send_message(_("You have unselected!"), ephemeral=True)
+        self.player.last_interaction = interaction
+
+
 class JudgeView(discord.ui.View):
     def __init__(self, day, player) -> None:
         super().__init__(timeout=None)
@@ -1795,7 +1860,7 @@ class ExplainView(discord.ui.View):
 
 class PollView(JoinGameView):
     def __init__(self, cog: commands.Cog, threshold: int = 5) -> None:
-        discord.ui.View.__init__(self, timeout=10 * 60)
+        discord.ui.View.__init__(self, timeout=20 * 60)
         self.ctx: commands.Context = None
         self.cog: commands.Cog = cog
         self.threshold: int = threshold

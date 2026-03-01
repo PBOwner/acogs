@@ -33,17 +33,19 @@ from .constants import (
     VILLAGERS_COLOR,
     VOTING_AND_JUDGEMENT_COLOR,
 )  # NOQA
+from .famine_apocalypses import VoteCollapse
 from .modes import Classic, Mode
 from .roles import (
     ACHIEVEMENTS,
     MAFIA_HIERARCHY,
     ROLES,
-    ROLES_PRIORITY,
+    ROLE_PRIORITY,
     TARGET_TYPE_HINT,
     Alchemist,
     Blackmailer,
     Developer,
     Doctor,
+    Famine,
     Gambler,
     GodFather,
     Judge,
@@ -186,7 +188,7 @@ class Night(DayNight):
             for player, target in sorted(
                 self.targets.items(),
                 key=lambda item: (
-                    ROLES_PRIORITY.index(item[0].role),
+                    ROLE_PRIORITY.index(item[0].role),
                     self.game.players.index(item[0]),
                 ),
             )
@@ -210,7 +212,7 @@ class Night(DayNight):
                 self.targets.pop(player, None)
                 continue
             final_role = player.role
-            if player.first_role_night_number == self.number:
+            if (first_role_night_number := player.first_role_night_number) == self.number:
                 player.role = player.previous_role
             if (
                 player.role is GodFather
@@ -242,9 +244,9 @@ class Night(DayNight):
                             [
                                 p
                                 for p in self.game.alive_players
-                                if ROLES_PRIORITY.index(p.role) < ROLES_PRIORITY.index(player.role)
+                                if ROLE_PRIORITY.index(p.role) < ROLE_PRIORITY.index(player.role)
                             ],
-                            key=lambda p: ROLES_PRIORITY.index(p.role),
+                            key=lambda p: ROLE_PRIORITY.index(p.role),
                         ):
                             try:
                                 tg = await p.role.check_pt(self, p, player, tg)
@@ -290,6 +292,8 @@ class Night(DayNight):
                 t for p, t in self.targets.items() if p.role is GodFather
             ]:
                 player.game_targets.append(target)
+            if player.first_role_night_number != first_role_night_number:
+                final_role = player.role
             player.role = final_role
         if (afk_days_before_kick := self.game.config["afk_days_before_kick"]) is not None:
             for player, days in self.game.afk_players.copy().items():
@@ -410,11 +414,20 @@ class Day(DayNight):
                     break
                 await self.game.send(**self.game.current_anomaly.get_kwargs(self.game))
             remaining_players: typing.List[Player] = self.game.alive_players
-            minimum_votes_required = (
-                len(remaining_players) // 2 + 1
-                if len(remaining_players) % 2
-                else len(remaining_players) // 2
-            )
+            if not any(
+                player
+                for player in self.game.players
+                if player.role is Famine
+                and player in self.game.days_nights[-2].targets
+                and player.famine_used_apocalypses[-1] is VoteCollapse
+            ):
+                minimum_votes_required = (
+                    len(remaining_players) // 2 + 1
+                    if len(remaining_players) % 2
+                    else len(remaining_players) // 2
+                )
+            else:
+                minimum_votes_required = 0
             voting_timeout = (
                 self.game.config["voting_timeout"]
                 if self.game.current_anomaly is not LightningRound
@@ -526,7 +539,7 @@ class Day(DayNight):
                                     ":\n"
                                     + "\n".join(
                                         [
-                                            f"- {voter.member.mention}{f' **+{extra_votes}**' if (extra_votes := get_extra_votes(voter, for_displaying=True)) else ''}"
+                                            f"- {voter.member.mention}" + (f" **{'+' if extra_votes > 0 else ''}{extra_votes}**" if (extra_votes := get_extra_votes(voter, for_displaying=True)) != 0 else "")
                                             for voter in votes[player]
                                         ]
                                     )
@@ -857,7 +870,7 @@ class Game:
             )
         self.channel: typing.Union[discord.TextChannel] = await self.ctx.guild.create_text_channel(
             name="mafia",
-            topic=_("A game of Mafia is currently in progress."),
+            topic=_("A game of Mafia is currently in progress..."),
             overwrites=overwrites,
             category=category,
             reason="Creating a Mafia channel.",
@@ -1073,7 +1086,7 @@ class Game:
                 for player in self.players
                 if player.has_won and not player.role.objective_secondary
             ],
-            key=lambda player: (player.is_dead, ROLES_PRIORITY.index(player.role)),
+            key=lambda player: (player.is_dead, ROLE_PRIORITY.index(player.role)),
         )
         secondary_winners = sorted(
             [
@@ -1081,11 +1094,11 @@ class Game:
                 for player in self.players
                 if player.has_won and player.role.objective_secondary
             ],
-            key=lambda player: (player.is_dead, ROLES_PRIORITY.index(player.role)),
+            key=lambda player: (player.is_dead, ROLE_PRIORITY.index(player.role)),
         )
         losers = sorted(
             [player for player in self.players if not player.has_won],
-            key=lambda player: (player.is_dead, ROLES_PRIORITY.index(player.role)),
+            key=lambda player: (player.is_dead, ROLE_PRIORITY.index(player.role)),
         )
         embeds = []
         embed: discord.Embed = discord.Embed(
